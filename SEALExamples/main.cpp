@@ -3,6 +3,13 @@
 
 #include "seal.h"
 
+#define BILLION  1000000000L
+#define MILLION  1000000L
+#define N 100
+
+double compute_time_ms(struct timespec start,struct timespec stop){
+  return (( stop.tv_sec - start.tv_sec )*BILLION + ( stop.tv_nsec - start.tv_nsec ))/MILLION;
+}
 
 using namespace std;
 using namespace seal;
@@ -13,20 +20,24 @@ void example_basics();
 void example_weighted_average();
 void example_parameter_selection();
 void example_batching();
+void example_benchmark();
 
 int main()
 {
     // Example: Basics
-    example_basics();
+    // example_basics();
 
-    // Example: Weighted Average
-    example_weighted_average();
+    // // Example: Weighted Average
+    // example_weighted_average();
 
-    // Example: Automatic Parameter Selection
-    example_parameter_selection();
+    // // Example: Automatic Parameter Selection
+    // example_parameter_selection();
 
-    // Example: Batching using CRT
-    example_batching();
+    // // Example: Batching using CRT
+    // example_batching();
+
+    // Example: Benchmark
+    example_benchmark();
 
     // Wait for ENTER before closing screen.
     cout << "Press ENTER to exit" << endl;
@@ -598,4 +609,144 @@ void example_batching()
     // How much noise did we end up with?
     cout << "Noise in the result: " << inherent_noise(encrypted_scaled_square, parms, secret_key).significant_bit_count()
         << "/" << inherent_noise_max(parms).significant_bit_count() << " bits" << endl;
+}
+
+
+void example_benchmark()
+{
+    print_example_banner("Example: benchmark");
+
+    // Create encryption parameters.
+    EncryptionParameters parms;
+
+    /*
+    First choose the polynomial modulus. This must be a power-of-2 cyclotomic polynomial,
+    i.e. a polynomial of the form "1x^(power-of-2) + 1". We recommend using polynomials of
+    degree at least 1024.
+    */
+    parms.poly_modulus() = "1x^4096 + 1";
+
+    /*
+    Next choose the coefficient modulus. The values we recommend to be used are:
+
+    [ degree(poly_modulus), coeff_modulus ]
+    [ 1024, "FFFFFFF00001" ],
+    [ 2048, "3FFFFFFFFFFFFFFFFFF00001"],
+    [ 4096, "3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC0000001"],
+    [ 8192, "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE00000001"],
+    [ 16384, "7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000000001"].
+
+    These can be conveniently accessed using ChooserEvaluator::default_parameter_options(),
+    which returns the above list of options as an std::map, keyed by the degree of the polynomial modulus.
+    
+    The user can also relatively easily choose their custom coefficient modulus. It should be a prime number
+    of the form 2^A - 2^B + 1, where A > B > degree(poly_modulus). Moreover, B should be as small as possible
+    for improved efficiency in modular reduction. For security, we recommend strictly adhering to the following 
+    size bounds: (see Lepoint-Naehrig (2014) [https://eprint.iacr.org/2014/062])
+    /------------------------------------\
+    | poly_modulus | coeff_modulus bound |
+    | -------------|---------------------|
+    | 1x^1024 + 1  | 48 bits             |
+    | 1x^2048 + 1  | 96 bits             |
+    | 1x^4096 + 1  | 192 bits            |
+    | 1x^8192 + 1  | 384 bits            |
+    | 1x^16384 + 1 | 768 bits            |
+    \------------------------------------/
+    */
+    //parms.coeff_modulus() = ChooserEvaluator::default_parameter_options().at(4096);
+    parms.coeff_modulus() = BigUInt("7fffffffffffffffffffffffffffffff");
+
+    /*
+    Now we set the plaintext modulus. This can be any integer, even though here we take it to be a power of two.
+    A larger plaintext modulus causes the noise to grow faster in homomorphic multiplication, and
+    also lowers the maximum amount of noise in ciphertexts that the system can tolerate.
+    On the other hand, a larger plaintext modulus typically allows for better homomorphic integer arithmetic,
+    although this depends strongly on which encoder is used to encode integers into plaintext polynomials.
+    */
+    parms.plain_modulus() = 1 << 10;
+
+    /*
+    The decomposition bit count affects the behavior of the relinearization (key switch) operation,
+    which is typically performed after each homomorphic multiplication. A smaller decomposition
+    bit count makes relinearization slower, but improves the noise growth behavior on multiplication.
+    Conversely, a larger decomposition bit count makes homomorphic multiplication faster at the cost
+    of increased noise growth.
+    */
+    parms.decomposition_bit_count() = 32;
+
+    /*
+    We use a constant standard deviation for the error distribution. Using a larger standard
+    deviation will result in larger noise growth, but in theory should make the system more secure.
+    */
+    parms.noise_standard_deviation() = ChooserEvaluator::default_noise_standard_deviation();
+
+    /*
+    For the bound on the error distribution we can also use a constant default value
+    which is in fact 5 * ChooserEvaluator::default_noise_standard_deviation()
+    */
+    parms.noise_max_deviation() = ChooserEvaluator::default_noise_max_deviation();
+
+    cout << "Encryption parameters specify " << parms.poly_modulus().significant_coeff_count() << " coefficients with "
+        << parms.coeff_modulus().significant_bit_count() << " bits per coefficient" << endl;
+
+    // Encode two integers as polynomials.
+    const int value1 = 5;
+    const int value2 = -7;
+    BalancedEncoder encoder(parms.plain_modulus());
+    BigPoly encoded1 = encoder.encode(value1);
+    BigPoly encoded2 = encoder.encode(value2);
+    cout << "Encoded " << value1 << " as polynomial " << encoded1.to_string() << endl;
+    cout << "Encoded " << value2 << " as polynomial " << encoded2.to_string() << endl;
+
+    // Generate keys.
+    cout << "Generating keys..." << endl;
+    KeyGenerator generator(parms);
+    generator.generate();
+    cout << "... key generation complete" << endl;
+    BigPoly public_key = generator.public_key();
+    BigPoly secret_key = generator.secret_key();
+    EvaluationKeys evaluation_keys = generator.evaluation_keys();
+    //cout << "Public Key = " << public_key.to_string() << endl;
+    //cout << "Secret Key = " << secret_key.to_string() << endl;
+    float diff;
+    struct timespec start,stop;
+
+    // Encrypt values.
+    Encryptor encryptor(parms, public_key);
+    clock_gettime( CLOCK_REALTIME, &start);
+    for(int i = 0; i < N; i++){
+        BigPoly encrypted1 = encryptor.encrypt(encoded1);  
+    }
+    clock_gettime( CLOCK_REALTIME, &stop);
+    diff = compute_time_ms(start,stop);
+    std::cout << "Encrypt) " << diff/N << " ms." << std::endl;
+
+    BigPoly encrypted1 = encryptor.encrypt(encoded1);  
+    Decryptor decryptor(parms, secret_key);
+    clock_gettime( CLOCK_REALTIME, &start);
+    for(int i = 0; i < N; i++){
+        BigPoly decrypted1 = decryptor.decrypt(encrypted1);
+    }
+    clock_gettime( CLOCK_REALTIME, &stop);
+    diff = compute_time_ms(start,stop);
+    std::cout << "Decrypt) " << diff/N << " ms." << std::endl;
+
+    BigPoly encrypted2 = encryptor.encrypt(encoded2);  
+    Evaluator evaluator(parms, evaluation_keys);
+    clock_gettime( CLOCK_REALTIME, &start);
+    for(int i = 0; i < N; i++){
+        BigPoly encryptedsum = evaluator.add(encrypted1, encrypted2);
+    }
+    clock_gettime( CLOCK_REALTIME, &stop);
+    diff = compute_time_ms(start,stop);
+    std::cout << "H. Addition) " << diff/N << " ms." << std::endl;
+
+    clock_gettime( CLOCK_REALTIME, &start);
+    for(int i = 0; i < N; i++){
+        BigPoly encryptedproduct = evaluator.multiply(encrypted1, encrypted2);
+    }
+    clock_gettime( CLOCK_REALTIME, &stop);
+    diff = compute_time_ms(start,stop);
+    std::cout << "H. Mul) " << diff/N << " ms." << std::endl;
+
 }
